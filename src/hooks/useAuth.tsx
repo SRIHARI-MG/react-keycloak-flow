@@ -5,6 +5,7 @@ import { Modal } from "antd";
 interface AuthHookReturn {
   isLogin: boolean;
   accessToken: string;
+  refreshToken: string;
   loading: boolean;
   isTokenExpired: boolean;
   regenerateToken: () => Promise<string | null>;
@@ -15,20 +16,28 @@ export const useAuth = (): AuthHookReturn => {
   const [isLogin, setIsLogin] = useState(false);
   const [loading, setLoading] = useState(true);
   const [accessToken, setAccessToken] = useState("");
+  const [refreshToken, setRefreshToken] = useState("");
   const [isTokenExpired, setIsTokenExpired] = useState(false);
 
   const isLoaded = useRef(false);
-  const client = useRef(
-    new Keycloak({
+  const clientRef = useRef<Keycloak | null>(null);
+  const tokenCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  const initKeycloak = useCallback(() => {
+    const keycloakInstance = new Keycloak({
       url: import.meta.env.VITE_KEYCLOAK_URL,
       realm: import.meta.env.VITE_KEYCLOAK_REALM,
       clientId: import.meta.env.VITE_KEYCLOAK_CLIENT,
-    })
-  );
-  const tokenCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
+    });
+
+    clientRef.current = keycloakInstance;
+    return keycloakInstance;
+  }, []);
 
   const checkTokenExpiration = useCallback(() => {
-    const tokenParsed = client.current.tokenParsed;
+    if (!clientRef.current) return;
+
+    const tokenParsed = clientRef.current.tokenParsed;
     if (tokenParsed && tokenParsed.exp) {
       const currentTime = Math.floor(Date.now() / 1000);
       const isExpired = currentTime >= tokenParsed.exp;
@@ -44,7 +53,7 @@ export const useAuth = (): AuthHookReturn => {
           okText: "Stay signed in",
           cancelText: "Logout",
           onOk: async () => {
-            clearTimeout(timeoutId); // Clear timeout if the user chooses to stay signed in
+            clearTimeout(timeoutId);
             try {
               const newToken = await regenerateToken();
               if (newToken) {
@@ -57,12 +66,11 @@ export const useAuth = (): AuthHookReturn => {
             }
           },
           onCancel: () => {
-            clearTimeout(timeoutId); // Clear timeout if the user explicitly logs out
+            clearTimeout(timeoutId);
             handleLogout();
           },
         });
 
-        // Auto logout after 5 seconds if no action is taken
         timeoutId = setTimeout(() => {
           modal.destroy();
           handleLogout();
@@ -73,85 +81,125 @@ export const useAuth = (): AuthHookReturn => {
 
   const regenerateToken = async (): Promise<string | null> => {
     try {
-      await client.current.updateToken(-1);
+      const response = await fetch(
+        `${import.meta.env.VITE_KEYCLOAK_URL}/realms/${
+          import.meta.env.VITE_KEYCLOAK_REALM
+        }/protocol/openid-connect/token`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            client_id: import.meta.env.VITE_KEYCLOAK_CLIENT,
+            ...(import.meta.env.VITE_KEYCLOAK_CLIENT_SECRET
+              ? { client_secret: import.meta.env.VITE_KEYCLOAK_CLIENT_SECRET }
+              : {}),
+            refresh_token: localStorage.getItem("refreshToken") || "",
+          }),
+        }
+      );
 
-      const newToken = client.current.token;
-      if (newToken) {
-        setAccessToken(newToken);
-        setIsTokenExpired(false);
-        return newToken;
+      if (!response.ok) {
+        throw new Error(`Failed to refresh token: ${response.statusText}`);
       }
 
-      return null;
+      const data = await response.json();
+      setAccessToken(data.access_token);
+      setIsTokenExpired(false);
+      return data.access_token;
     } catch (error) {
-      console.error("Token regeneration failed", error);
-
-      Modal.error({
-        title: "Token Regeneration Failed",
-        content: "Unable to regenerate token. Please login again.",
-      });
-
-      setIsTokenExpired(true);
+      console.error("Token regeneration failed:", error);
       return null;
     }
   };
 
-  const handleLogout = () => {
-    // Clear the token check interval before logout
+  const handleLogout = useCallback(() => {
     if (tokenCheckIntervalRef.current) {
       clearInterval(tokenCheckIntervalRef.current);
     }
 
-    client.current.logout({
-      redirectUri: window.location.origin,
-    });
-  };
+    if (clientRef.current) {
+      try {
+        clientRef.current.logout({
+          redirectUri: window.location.origin,
+        });
+      } catch (error) {
+        console.error("Logout failed:", error);
+        localStorage.clear();
+        window.location.href = window.location.origin;
+      }
+    } else {
+      localStorage.clear();
+      window.location.href = window.location.origin;
+    }
+  }, []);
 
   useEffect(() => {
     if (isLoaded.current) return;
     isLoaded.current = true;
 
-    client.current
-      .init({
-        onLoad: "login-required",
-        checkLoginIframe: false,
-        pkceMethod: "S256",
-      })
-      .then((authenticated) => {
-        if (authenticated) {
-          console.log("Authenticated successfully.");
-          setIsLogin(true);
-          setAccessToken(client.current.token!);
+    const storedRefreshToken = localStorage.getItem("refreshToken");
 
-          // Initial token expiration check
-          checkTokenExpiration();
+    if (storedRefreshToken) {
+      setRefreshToken(storedRefreshToken);
+      setIsLogin(true);
+      setLoading(false);
 
-          // Set up periodic token expiration check every 30 seconds
-          tokenCheckIntervalRef.current = setInterval(() => {
+      tokenCheckIntervalRef.current = setInterval(() => {
+        checkTokenExpiration();
+      }, 30000);
+    } else {
+      const keycloakClient = initKeycloak();
+      keycloakClient
+        .init({
+          onLoad: "login-required",
+          checkLoginIframe: false,
+          pkceMethod: "S256",
+        })
+        .then((authenticated) => {
+          if (authenticated) {
+            console.log("Authenticated successfully.");
+            setIsLogin(true);
+            setAccessToken(keycloakClient.token!);
+            if (localStorage.getItem("refreshToken") === null) {
+              localStorage.setItem(
+                "refreshToken",
+                keycloakClient.refreshToken!
+              );
+            }
+
+            setRefreshToken(keycloakClient.refreshToken!);
+
             checkTokenExpiration();
-          }, 30000);
-        } else {
-          console.log("User not authenticated.");
-          setIsLogin(false);
-        }
-        setLoading(false);
-      })
-      .catch((err) => {
-        console.error("Keycloak initialization failed:", err);
-        setLoading(false);
-      });
 
-    // Cleanup interval on component unmount
+            tokenCheckIntervalRef.current = setInterval(() => {
+              checkTokenExpiration();
+            }, 30000);
+          } else {
+            console.log("User not authenticated.");
+            setIsLogin(false);
+          }
+          setLoading(false);
+        })
+        .catch((err) => {
+          console.error("Keycloak initialization failed:", err);
+          setLoading(false);
+        });
+    }
+
     return () => {
       if (tokenCheckIntervalRef.current) {
         clearInterval(tokenCheckIntervalRef.current);
       }
     };
-  }, [checkTokenExpiration]);
+  }, [checkTokenExpiration, initKeycloak]);
 
   return {
     isLogin,
     accessToken,
+    refreshToken: localStorage.getItem("refreshToken") || "",
     loading,
     isTokenExpired,
     regenerateToken,
