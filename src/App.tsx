@@ -62,7 +62,7 @@ function App() {
           alignItems: "center",
         }}
       >
-        Error: Missing token. Redirecting...
+        <Spin size="large" />
       </div>
     );
   }

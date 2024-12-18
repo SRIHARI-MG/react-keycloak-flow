@@ -2,12 +2,64 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import Keycloak from "keycloak-js";
 import { Modal } from "antd";
 
+const createTokenManager = () => {
+  return {
+    setTokens: (
+      accessToken: string,
+      refreshToken: string,
+      expiresIn: number
+    ) => {
+      try {
+        const expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
+
+        localStorage.setItem("accessToken", accessToken);
+        if (!localStorage.getItem("refreshToken")) {
+          localStorage.setItem("refreshToken", refreshToken);
+        }
+        localStorage.setItem("tokenExpiresAt", expiresAt.toString());
+        localStorage.setItem("tokenInitialTime", Date.now().toString());
+      } catch (error) {
+        console.error("Failed to store tokens", error);
+      }
+    },
+
+    getTokens: () => {
+      return {
+        accessToken: localStorage.getItem("accessToken") || "",
+        refreshToken: localStorage.getItem("refreshToken") || "",
+        expiresAt: parseInt(localStorage.getItem("tokenExpiresAt") || "0"),
+        initialTime: parseInt(localStorage.getItem("tokenInitialTime") || "0"),
+      };
+    },
+
+    calculateRemainingTime: () => {
+      const { expiresAt } = tokenManager.getTokens();
+      const currentTime = Math.floor(Date.now() / 1000);
+      return Math.max(expiresAt - currentTime, 0);
+    },
+
+    clear: () => {
+      try {
+        localStorage.removeItem("accessToken");
+        localStorage.removeItem("refreshToken");
+        localStorage.removeItem("tokenExpiresAt");
+        localStorage.removeItem("tokenInitialTime");
+      } catch (error) {
+        console.error("Failed to clear tokens", error);
+      }
+    },
+  };
+};
+
+const tokenManager = createTokenManager();
+
 interface AuthHookReturn {
   isLogin: boolean;
   accessToken: string;
   refreshToken: string;
   loading: boolean;
   isTokenExpired: boolean;
+  remainingTime: number;
   regenerateToken: () => Promise<string | null>;
   logout: () => void;
 }
@@ -18,10 +70,13 @@ export const useAuth = (): AuthHookReturn => {
   const [accessToken, setAccessToken] = useState("");
   const [refreshToken, setRefreshToken] = useState("");
   const [isTokenExpired, setIsTokenExpired] = useState(false);
+  const [remainingTime, setRemainingTime] = useState(0);
 
   const isLoaded = useRef(false);
   const clientRef = useRef<Keycloak | null>(null);
   const tokenCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const modalRef = useRef<{ destroy: () => void } | null>(null);
+  const isModalOpenRef = useRef(false);
 
   const initKeycloak = useCallback(() => {
     const keycloakInstance = new Keycloak({
@@ -34,53 +89,68 @@ export const useAuth = (): AuthHookReturn => {
     return keycloakInstance;
   }, []);
 
-  const checkTokenExpiration = useCallback(() => {
-    if (!clientRef.current) return;
+  const startTokenCountdown = useCallback(() => {
+    if (tokenCheckIntervalRef.current) {
+      clearInterval(tokenCheckIntervalRef.current);
+    }
 
-    const tokenParsed = clientRef.current.tokenParsed;
-    if (tokenParsed && tokenParsed.exp) {
+    tokenCheckIntervalRef.current = setInterval(() => {
+      const { expiresAt } = tokenManager.getTokens();
       const currentTime = Math.floor(Date.now() / 1000);
-      const isExpired = currentTime >= tokenParsed.exp;
+      const timeLeft = Math.max(expiresAt - currentTime, 0);
 
-      setIsTokenExpired(isExpired);
+      console.log("Token expiration check:", {
+        currentTime,
+        expiresAt,
+        timeLeft,
+      });
 
-      if (isExpired) {
-        let timeoutId: NodeJS.Timeout;
+      setRemainingTime(timeLeft);
 
-        const modal = Modal.confirm({
-          title: "Token Expired",
-          content: "Your session has expired. Please choose an action.",
+      if (timeLeft <= 5 && !isModalOpenRef.current) {
+        isModalOpenRef.current = true;
+
+        modalRef.current = Modal.confirm({
+          title: "Session Expiring",
+          content: `Your session is about to expire in ${timeLeft} seconds. Do you want to stay signed in?`,
           okText: "Stay signed in",
           cancelText: "Logout",
           onOk: async () => {
-            clearTimeout(timeoutId);
             try {
               const newToken = await regenerateToken();
               if (newToken) {
-                setAccessToken(newToken);
+                isModalOpenRef.current = false;
+                modalRef.current?.destroy();
               } else {
                 handleLogout();
               }
             } catch (error) {
               console.error("Token refresh failed", error);
+              handleLogout();
             }
           },
           onCancel: () => {
-            clearTimeout(timeoutId);
             handleLogout();
+          },
+          afterClose: () => {
+            isModalOpenRef.current = false;
           },
         });
 
-        timeoutId = setTimeout(() => {
-          modal.destroy();
-          handleLogout();
+        setTimeout(() => {
+          if (isModalOpenRef.current) {
+            modalRef.current?.destroy();
+            handleLogout();
+          }
         }, 5000);
       }
-    }
+    }, 1000);
   }, []);
 
   const regenerateToken = async (): Promise<string | null> => {
     try {
+      const { refreshToken: currentRefreshToken } = tokenManager.getTokens();
+
       const response = await fetch(
         `${import.meta.env.VITE_KEYCLOAK_URL}/realms/${
           import.meta.env.VITE_KEYCLOAK_REALM
@@ -96,7 +166,7 @@ export const useAuth = (): AuthHookReturn => {
             ...(import.meta.env.VITE_KEYCLOAK_CLIENT_SECRET
               ? { client_secret: import.meta.env.VITE_KEYCLOAK_CLIENT_SECRET }
               : {}),
-            refresh_token: localStorage.getItem("refreshToken") || "",
+            refresh_token: currentRefreshToken,
           }),
         }
       );
@@ -106,7 +176,20 @@ export const useAuth = (): AuthHookReturn => {
       }
 
       const data = await response.json();
+
+      const expiresIn = data.expires_in || 120;
+
+      // Set new access token
       setAccessToken(data.access_token);
+
+      localStorage.setItem("accessToken", data.access_token);
+      localStorage.setItem(
+        "tokenExpiresAt",
+        (Math.floor(Date.now() / 1000) + expiresIn).toString()
+      );
+
+      startTokenCountdown();
+
       setIsTokenExpired(false);
       return data.access_token;
     } catch (error) {
@@ -115,23 +198,51 @@ export const useAuth = (): AuthHookReturn => {
     }
   };
 
-  const handleLogout = useCallback(() => {
+  const handleLogout = useCallback(async () => {
+    if (modalRef.current) {
+      modalRef.current.destroy();
+    }
+
     if (tokenCheckIntervalRef.current) {
       clearInterval(tokenCheckIntervalRef.current);
     }
 
-    if (clientRef.current) {
-      try {
-        clientRef.current.logout({
-          redirectUri: window.location.origin,
-        });
-      } catch (error) {
-        console.error("Logout failed:", error);
-        localStorage.clear();
-        window.location.href = window.location.origin;
+    const {
+      accessToken: currentAccessToken,
+      refreshToken: currentRefreshToken,
+    } = tokenManager.getTokens();
+
+    try {
+      const response = await fetch(
+        `${import.meta.env.VITE_KEYCLOAK_URL}/realms/${
+          import.meta.env.VITE_KEYCLOAK_REALM
+        }/protocol/openid-connect/logout`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${currentAccessToken}`,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: new URLSearchParams({
+            client_id: import.meta.env.VITE_KEYCLOAK_CLIENT,
+            refresh_token: currentRefreshToken,
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Failed to log out: ${response.statusText}`);
       }
-    } else {
-      localStorage.clear();
+
+      console.log("Logout successful on the server.");
+    } catch (error) {
+      console.error("Server logout failed:", error);
+    } finally {
+      tokenManager.clear();
+      setAccessToken("");
+      setRefreshToken("");
+      setIsLogin(false);
+
       window.location.href = window.location.origin;
     }
   }, []);
@@ -140,16 +251,23 @@ export const useAuth = (): AuthHookReturn => {
     if (isLoaded.current) return;
     isLoaded.current = true;
 
-    const storedRefreshToken = localStorage.getItem("refreshToken");
+    const {
+      accessToken: storedAccessToken,
+      refreshToken: storedRefreshToken,
+      expiresAt,
+    } = tokenManager.getTokens();
 
-    if (storedRefreshToken) {
+    if (
+      storedAccessToken &&
+      storedRefreshToken &&
+      expiresAt > Math.floor(Date.now() / 1000)
+    ) {
       setRefreshToken(storedRefreshToken);
+      setAccessToken(storedAccessToken);
       setIsLogin(true);
       setLoading(false);
 
-      tokenCheckIntervalRef.current = setInterval(() => {
-        checkTokenExpiration();
-      }, 30000);
+      startTokenCountdown();
     } else {
       const keycloakClient = initKeycloak();
       keycloakClient
@@ -162,21 +280,21 @@ export const useAuth = (): AuthHookReturn => {
           if (authenticated) {
             console.log("Authenticated successfully.");
             setIsLogin(true);
-            setAccessToken(keycloakClient.token!);
-            if (localStorage.getItem("refreshToken") === null) {
-              localStorage.setItem(
-                "refreshToken",
-                keycloakClient.refreshToken!
-              );
-            }
 
+            const expiresIn = keycloakClient.tokenParsed?.exp
+              ? keycloakClient.tokenParsed.exp - Math.floor(Date.now() / 1000)
+              : 120; 
+
+            tokenManager.setTokens(
+              keycloakClient.token!,
+              keycloakClient.refreshToken!,
+              expiresIn
+            );
+
+            setAccessToken(keycloakClient.token!);
             setRefreshToken(keycloakClient.refreshToken!);
 
-            checkTokenExpiration();
-
-            tokenCheckIntervalRef.current = setInterval(() => {
-              checkTokenExpiration();
-            }, 30000);
+            startTokenCountdown();
           } else {
             console.log("User not authenticated.");
             setIsLogin(false);
@@ -194,14 +312,19 @@ export const useAuth = (): AuthHookReturn => {
         clearInterval(tokenCheckIntervalRef.current);
       }
     };
-  }, [checkTokenExpiration, initKeycloak]);
+  }, [startTokenCountdown, initKeycloak]);
+
+  useEffect(() => {
+    startTokenCountdown();
+  }, []);
 
   return {
     isLogin,
     accessToken,
-    refreshToken: localStorage.getItem("refreshToken") || "",
+    refreshToken,
     loading,
     isTokenExpired,
+    remainingTime,
     regenerateToken,
     logout: handleLogout,
   };
